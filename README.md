@@ -4,7 +4,7 @@
 This is a multi-agent primary school tutoring system built with **Python + LangGraph**.
 
 The system has 4 roles:
-- `orchestrator`: decides which agent to call based on user input, and decides when to stop after multi-step coordination.
+- `orchestrator`: uses an LLM-based routing decision to choose which agent to call next, and decides when to stop after multi-step coordination.
 - `Agent-01 (Chinese Tutor)`: private Chinese tutor, only allowed to use `get_poem_tool`.
 - `Agent-02 (Math Tutor)`: private Math tutor, not allowed to use any external tool.
 - `Agent-03 (Weekly Planner)`: weekly study planner, only allowed to use `get_date_tool`.
@@ -23,6 +23,10 @@ Hard permission isolation:
 - Planner Agent binds only `get_date_tool`
 - Math Agent binds no tools
 - Orchestrator does not call tools
+
+Routing behavior:
+- Orchestrator is LLM-driven (not keyword-only matching).
+- Orchestrator chooses one route per decision: `chinese`, `math`, `planner`, or `finish`.
 
 ## 3. Project Structure
 ```text

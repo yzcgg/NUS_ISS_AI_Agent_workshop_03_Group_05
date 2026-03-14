@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Literal, Sequence
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
@@ -16,11 +17,26 @@ from .tools import get_date_tool, get_poem_tool
 
 RouteName = Literal["chinese", "math", "planner", "finish"]
 
-ORCHESTRATOR_HINTS: dict[str, list[str]] = {
-    "chinese": ["chinese", "语文", "古诗", "诗", "阅读", "作文", "汉字", "拼音"],
-    "math": ["math", "数学", "加", "减", "乘", "除", "算", "方程", "几何"],
-    "planner": ["plan", "planner", "schedule", "学习计划", "计划", "每周", "周计划", "安排"],
-}
+ORCHESTRATOR_PROMPT = """
+You are the Orchestrator of a multi-agent primary school tutoring system.
+
+Available routes:
+- chinese: Chinese language tutoring
+- math: Math tutoring
+- planner: Weekly study planning
+- finish: End this turn and return collected agent answers
+
+Decision rules:
+- Infer which routes are explicitly needed by the latest user request.
+- Never add unrelated routes that the user did not ask for.
+- Then choose the next route from that inferred route list.
+- If all inferred routes are completed, choose finish.
+- Do not call tools directly.
+
+Output format:
+Return strict JSON only, with keys:
+{"routes": ["chinese|math|planner"], "reason": "short reason"}
+"""
 
 CHINESE_AGENT_PROMPT = """
 You are Agent-01, a private Chinese tutor for primary school students.
@@ -30,7 +46,7 @@ Goals:
 - If suitable, call get_poem_tool to provide one random Chinese poem line.
 Rules:
 - Keep answer concise and practical for children.
-- Use Chinese in your final answer to the student.
+- Use English in your final answer to the student.
 """
 
 MATH_AGENT_PROMPT = """
@@ -40,7 +56,7 @@ Goals:
 - Keep a friendly and educational style.
 Rules:
 - Do not use any external tool.
-- Use Chinese in your final answer to the student.
+- Use English in your final answer to the student.
 """
 
 PLANNER_AGENT_PROMPT = """
@@ -50,7 +66,7 @@ Goals:
 - Call get_date_tool to anchor the plan with the current date/time.
 Rules:
 - Give clear daily tasks and short durations.
-- Use Chinese in your final answer to the student.
+- Use English in your final answer to the student.
 """
 
 
@@ -91,15 +107,29 @@ def _collect_current_turn_answers(messages: Sequence[BaseMessage]) -> list[str]:
     return answers
 
 
-def _infer_pending_routes(user_text: str) -> list[str]:
-    lowered = user_text.lower()
-    pending: list[str] = []
-    for route, keywords in ORCHESTRATOR_HINTS.items():
-        if any(keyword in lowered for keyword in keywords):
-            pending.append(route)
-    if pending:
-        return pending
-    return ["math"]
+def _parse_orchestrator_routes(decision_text: str) -> list[str]:
+    candidates = ("chinese", "math", "planner")
+    lowered = decision_text.lower().strip()
+    routes: list[str] = []
+
+    try:
+        parsed = json.loads(decision_text)
+        if isinstance(parsed, dict):
+            raw_routes = parsed.get("routes", [])
+            if isinstance(raw_routes, list):
+                for item in raw_routes:
+                    route = str(item).lower().strip()
+                    if route in candidates and route not in routes:
+                        routes.append(route)
+            if routes:
+                return routes
+    except json.JSONDecodeError:
+        pass
+
+    for route in candidates:
+        if f'"{route}"' in lowered or route in lowered:
+            routes.append(route)
+    return routes or ["math"]
 
 
 def _extract_delta_messages(
@@ -130,8 +160,8 @@ def build_graph(model_name: str = "gpt-4o-mini"):
 
     def orchestrator_node(state: TutorState) -> dict:
         turn_count = state.get("turn_count", 0)
-        pending_routes = state.get("pending_routes", [])
-        completed_routes = state.get("completed_routes", [])
+        pending_routes = list(state.get("pending_routes", []))
+        completed_routes = list(state.get("completed_routes", []))
         messages = state.get("messages", [])
         tool_events = list(state.get("tool_events", []))
 
@@ -139,9 +169,24 @@ def build_graph(model_name: str = "gpt-4o-mini"):
             tool_events.append(f"orchestrator -> finish (max_turns={max_turns})")
             return {"route": "finish", "tool_events": tool_events}
 
+        latest_user_text = _latest_user_message(messages)
         if not pending_routes:
-            latest_user_text = _latest_user_message(messages)
-            pending_routes = _infer_pending_routes(latest_user_text)
+            decision = llm.invoke(
+                [
+                    ("system", ORCHESTRATOR_PROMPT),
+                    (
+                        "human",
+                        (
+                            "Infer the route list needed for this user request.\\n"
+                            f"latest_user_message: {latest_user_text}\\n"
+                            "Return JSON only."
+                        ),
+                    ),
+                ]
+            )
+            decision_text = _stringify_content(decision.content).strip()
+            pending_routes = _parse_orchestrator_routes(decision_text)
+            tool_events.append(f"orchestrator llm routes: {decision_text}")
             tool_events.append(f"orchestrator intent queue: {pending_routes}")
 
         next_route: RouteName = "finish"
@@ -150,8 +195,12 @@ def build_graph(model_name: str = "gpt-4o-mini"):
                 next_route = route  # type: ignore[assignment]
                 break
 
+        if next_route in completed_routes and next_route != "finish":
+            next_route = "finish"
+            tool_events.append("orchestrator override: repeated route -> finish")
+
         if next_route == "finish":
-            tool_events.append("orchestrator -> finish (all intents completed)")
+            tool_events.append("orchestrator -> finish (all inferred intents completed)")
             return {
                 "route": "finish",
                 "pending_routes": pending_routes,
